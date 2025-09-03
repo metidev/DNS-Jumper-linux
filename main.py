@@ -265,6 +265,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._latency_measured = False
 
         self.profiles = load_profiles()
+        if not self.profiles:
+            default_profiles = [
+                {"name": "Cloudflare", "servers": ["1.1.1.1", "1.0.0.1"]},
+                {"name": "Google DNS", "servers": ["8.8.8.8", "8.8.4.4"]},
+                {"name": "OpenDNS", "servers": ["208.67.222.222", "208.67.220.220"]},
+            ]
+            self.profiles.extend(default_profiles)
+            save_profiles(self.profiles)
+
         self.store = Gio.ListStore.new(Profile)
         for p in self.profiles:
             obj = Profile()
@@ -497,20 +506,32 @@ class MainWindow(Adw.ApplicationWindow):
         if idx < 0:
             self._info_toast("Select a profile first")
             return
+
         profile_obj = self.store.get_item(idx)
         servers_str = profile_obj.get_property("servers") or ""
         servers = [s.strip() for s in servers_str.split(",") if s.strip()]
 
-        self.set_btn.set_sensitive(False); self.set_btn.set_label("Applying…")
+        if len(servers) < 2:
+            self._info_toast("Provide at least two DNS servers before applying")
+            return
+
+        self.set_btn.set_sensitive(False)
+        self.set_btn.set_label("Applying…")
+
         def worker():
             try:
                 apply_dns_with_one_pkexec(servers)
                 GLib.idle_add(lambda: self._info_toast("DNS applied"))
                 GLib.idle_add(play_success_sound)
+            except ValueError as ve:
+                GLib.idle_add(lambda: self._info_toast(f"Invalid DNS: {ve}"))
+            except RuntimeError as re:
+                GLib.idle_add(lambda: self._info_toast(f"Failed to apply DNS: {re}"))
             except Exception as e:
-                GLib.idle_add(lambda: self._info_toast(str(e)))
+                GLib.idle_add(lambda: self._info_toast(f"Unexpected error: {e}"))
             finally:
                 GLib.idle_add(lambda: (self.set_btn.set_label("Set DNS"), self.set_btn.set_sensitive(True)))
+
         threading.Thread(target=worker, daemon=True).start()
 
 # ----------------------------- Application -----------------------------
