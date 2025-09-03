@@ -1,0 +1,14 @@
+Package: dnsjumper
+Version: 1.0-1
+Section: net
+Priority: optional
+Architecture: all
+Maintainer: MetiDev <mehdicode3@example.com>
+Depends: python3 (>= 3.9), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, python3-dnspython, network-manager, libcanberra-gtk3-module | libcanberra-gtk-module
+Description: DNS Jumper for Linux
+ A polished GUI tool to test and set DNS servers using NetworkManager.
+ Features:
+  - Add and save multiple DNS profiles
+  - Test latency of DNS servers
+  - Apply DNS instantly with one pkexec
+  - Plays success sound on apply
