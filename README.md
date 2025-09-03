@@ -26,10 +26,8 @@ You need a Linux-based system, preferably Ubuntu or a similar Debian-based distr
 For the fastest installation, you can download the latest `.deb` package from the [Releases page](https://www.google.com/search?q=https://github.com/MetiDev/linux-DNS-jumper/releases) and use the following command in your terminal:
 
 ```bash
-sudo apt install ./dnsjumper_1.0.deb
+./install.sh
 ```
-
-**Note**: Replace `dnsjumper_1.0.deb` with the actual file name of the downloaded package.
 
 -----
 
