@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# DNS Jumper — polished build
-# Fixes:
+# DNS Jumper — polished build with Auto Best DNS
+# Features:
 # - Immediate display of test results (ListView refreshed after tests finish)
 # - Header labels aligned with columns
 # - Sort disabled until tests run and only sorts when there are valid latencies
 # - Delete icon uses user-trash-symbolic and deletes immediately + persists
 # - IP validation enforced (primary + secondary required)
 # - Single pkexec invocation to reduce password prompts
+# - Auto Best DNS: Test all profiles and apply the fastest automatically
+# - Removed Reset to Default functionality
 #
 import os
 import json
@@ -180,6 +182,55 @@ def apply_dns_with_one_pkexec(servers):
     except subprocess.CalledProcessError:
         raise RuntimeError("Failed to verify nmcli connection settings after apply")
 
+def reset_dns_to_automatic():
+    uuid, device = get_active_connection_and_device()
+    if not uuid:
+        raise RuntimeError("No active NetworkManager connection found")
+
+    cmd_parts = []
+    cmd_parts.append("nmcli connection modify " + shlex.quote(uuid) + " ipv4.ignore-auto-dns no ipv4.dns ''")
+    cmd_parts.append("nmcli connection modify " + shlex.quote(uuid) + " ipv6.ignore-auto-dns no ipv6.dns ''")
+    cmd_parts.append("nmcli connection up " + shlex.quote(uuid))
+
+    if device:
+        # resolvectl can't "reset" so we just flush the cache
+        cmd_parts.append("resolvectl flush-caches")
+
+    shell_cmd = " && ".join(cmd_parts)
+
+    try:
+        subprocess.check_call(["pkexec", "bash", "-c", shell_cmd])
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Privileged command failed: {e}")
+
+# ----------------------------- Get Current DNS -----------------------------
+def get_current_dns():
+    try:
+        uuid, device = get_active_connection_and_device()
+        if device:
+            out = subprocess.check_output(["resolvectl", "status", device], text=True)
+            for line in out.splitlines():
+                if "DNS Servers:" in line:
+                    ips = re.findall(r'((?:\d{1,3}\.){3}\d{1,3}|[\da-fA-F:]+)', line)
+                    if ips:
+                        return ", ".join(ips)
+        # Fallback to nmcli
+        if uuid:
+            out4 = subprocess.check_output(["nmcli", "-g", "ipv4.dns", "connection", "show", uuid], text=True).strip()
+            out6 = subprocess.check_output(["nmcli", "-g", "ipv6.dns", "connection", "show", uuid], text=True).strip()
+            dns = []
+            if out4:
+                dns.extend(out4.split(';'))
+            if out6:
+                dns.extend(out6.split(';'))
+            if dns:
+                return ", ".join(dns)
+            else:
+                return "DHCP (Auto)"
+        return "No active connection"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 # ----------------------------- Sound -----------------------------
 def play_success_sound():
     if shutil.which("canberra-gtk-play"):
@@ -263,6 +314,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_title("DNS Jumper")
         self.set_default_size(820, 520)
         self._latency_measured = False
+        self._is_setting_dns = False # New flag to prevent multiple executions
 
         self.profiles = load_profiles()
         if not self.profiles:
@@ -292,7 +344,17 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_btn = Gtk.Button.new_with_label("Set DNS")
         self.set_btn.set_tooltip_text("Apply selected DNS via NetworkManager")
         self.set_btn.connect("clicked", self.on_set_selected)
-        header.pack_start(add_btn); header.pack_start(self.test_btn); header.pack_end(self.set_btn)
+        self.best_dns_btn = Gtk.Button.new_with_label("Find Best DNS")
+        self.best_dns_btn.set_tooltip_text("Test all profiles and apply the fastest DNS")
+        self.best_dns_btn.connect("clicked", self.on_find_best_dns)
+        
+        # Add Reset DNS button
+        self.reset_btn = Gtk.Button.new_with_label("Reset DNS")
+        self.reset_btn.set_tooltip_text("Reset DNS to automatic/DHCP settings")
+        self.reset_btn.connect("clicked", self.on_reset_dns)
+
+        header.pack_start(add_btn); header.pack_start(self.test_btn)
+        header.pack_end(self.set_btn); header.pack_end(self.best_dns_btn); header.pack_end(self.reset_btn)
 
         # column headers aligned with list columns
         header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -309,6 +371,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.selection = Gtk.SingleSelection(model=self.store)
         self.listview = Gtk.ListView(model=self.selection, factory=factory)
         self.listview.set_vexpand(True); self.listview.set_hexpand(True)
+
+        # Add key controller for Enter key
+        key_controller = Gtk.EventControllerKey.new()
+        key_controller.connect("key-released", self.on_key_released)
+        self.listview.add_controller(key_controller)
 
         scroller = Gtk.ScrolledWindow(); scroller.set_child(self.listview); scroller.set_vexpand(True); scroller.set_hexpand(True)
 
@@ -332,10 +399,27 @@ class MainWindow(Adw.ApplicationWindow):
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(header)
         toolbar_view.set_content(stack)
+
+        # Current DNS status bar
+        current_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        current_row.set_margin_top(6); current_row.set_margin_bottom(6); current_row.set_margin_start(12); current_row.set_margin_end(12)
+        current_lbl = Gtk.Label(label="Current Active DNS:", xalign=0)
+        current_lbl.add_css_class("heading")
+        self.current_dns_label = Gtk.Label(label="Loading...", xalign=0)
+        self.current_dns_label.add_css_class("body")
+        self.current_dns_label.set_hexpand(True)
+        current_row.append(current_lbl); current_row.append(self.current_dns_label)
+        toolbar_view.add_bottom_bar(current_row)
+
         overlay = Adw.ToastOverlay(); overlay.set_child(toolbar_view); self._toast_overlay = overlay
         self.set_content(overlay)
 
         self._sort_asc = True
+        self.update_current_dns()
+
+    def update_current_dns(self):
+        dns_str = get_current_dns()
+        self.current_dns_label.set_text(dns_str)
 
     # ----------------- List item UI -----------------
     def on_factory_setup(self, _factory, list_item):
@@ -475,6 +559,71 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.idle_add(finish)
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_find_best_dns(self, *_):
+        if dns is None:
+            self._info_toast("Install dnspython: sudo apt install python3-dnspython")
+            return
+
+        self.best_dns_btn.set_sensitive(False)
+        self.best_dns_btn.set_label("Finding Best DNS…")
+        self.test_btn.set_sensitive(False)
+        self.set_btn.set_sensitive(False)
+        self.reset_btn.set_sensitive(False)
+
+        def worker():
+            best_latency = float('inf')
+            best_servers = None
+            best_index = -1
+            any_latency = False
+            n = self.store.get_n_items()
+
+            for i in range(n):
+                try:
+                    obj = self.store.get_item(i)
+                    servers = [s.strip() for s in (obj.get_property("servers") or "").split(",") if s.strip()]
+                    latency = measure_dns_latency(servers) or 0.0
+                    if latency and latency > 0:
+                        any_latency = True
+                        if latency < best_latency:
+                            best_latency = latency
+                            best_servers = servers
+                            best_index = i
+                    def update(idx=i, val=latency):
+                        try:
+                            o = self.store.get_item(idx)
+                            o.set_property("latency", float(val))
+                        except Exception:
+                            pass
+                    GLib.idle_add(update)
+                except Exception:
+                    pass
+
+            def finish():
+                self._latency_measured = any_latency
+                self.best_dns_btn.set_label("Find Best DNS")
+                self.best_dns_btn.set_sensitive(True)
+                self.test_btn.set_sensitive(True)
+                self.set_btn.set_sensitive(True)
+                self.reset_btn.set_sensitive(True)
+                if any_latency and best_servers:
+                    try:
+                        apply_dns_with_one_pkexec(best_servers)
+                        self._info_toast(f"Applied fastest DNS: {self.store.get_item(best_index).get_property('name')} ({best_latency:.0f} ms)")
+                        GLib.idle_add(play_success_sound)
+                        GLib.idle_add(self.update_current_dns)
+                    except Exception as e:
+                        self._info_toast(f"Failed to apply DNS: {e}")
+                else:
+                    self._info_toast("No valid latency results — check network or servers")
+                self.selection = Gtk.SingleSelection(model=self.store)
+                self.listview.set_model(self.selection)
+                if any_latency:
+                    self.sort_btn.set_sensitive(True)
+                    self.sort_btn.set_tooltip_text("Sort profiles by measured latency")
+            GLib.idle_add(finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def on_sort_latency(self, *_):
         if not self._latency_measured:
             self._info_toast("Run “Test All” first to get latency results")
@@ -502,6 +651,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._info_toast("Sorted")
 
     def on_set_selected(self, *_):
+        if self._is_setting_dns:
+            return
+
         idx = self._get_selected_index()
         if idx < 0:
             self._info_toast("Select a profile first")
@@ -514,15 +666,20 @@ class MainWindow(Adw.ApplicationWindow):
         if len(servers) < 2:
             self._info_toast("Provide at least two DNS servers before applying")
             return
+        
+        self._is_setting_dns = True
 
         self.set_btn.set_sensitive(False)
         self.set_btn.set_label("Applying…")
+        self.best_dns_btn.set_sensitive(False)
+        self.reset_btn.set_sensitive(False)
 
         def worker():
             try:
                 apply_dns_with_one_pkexec(servers)
                 GLib.idle_add(lambda: self._info_toast("DNS applied"))
                 GLib.idle_add(play_success_sound)
+                GLib.idle_add(self.update_current_dns)
             except ValueError as ve:
                 GLib.idle_add(lambda: self._info_toast(f"Invalid DNS: {ve}"))
             except RuntimeError as re:
@@ -531,8 +688,38 @@ class MainWindow(Adw.ApplicationWindow):
                 GLib.idle_add(lambda: self._info_toast(f"Unexpected error: {e}"))
             finally:
                 GLib.idle_add(lambda: (self.set_btn.set_label("Set DNS"), self.set_btn.set_sensitive(True)))
+                GLib.idle_add(lambda: (self.best_dns_btn.set_sensitive(True), self.reset_btn.set_sensitive(True)))
+                self._is_setting_dns = False
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def on_reset_dns(self, *_):
+        self.reset_btn.set_sensitive(False)
+        self.reset_btn.set_label("Resetting…")
+        self.set_btn.set_sensitive(False)
+        self.best_dns_btn.set_sensitive(False)
+
+        def worker():
+            try:
+                reset_dns_to_automatic()
+                GLib.idle_add(lambda: self._info_toast("DNS reset to automatic"))
+                GLib.idle_add(self.update_current_dns)
+            except RuntimeError as re:
+                GLib.idle_add(lambda: self._info_toast(f"Failed to reset DNS: {re}"))
+            except Exception as e:
+                GLib.idle_add(lambda: self._info_toast(f"Unexpected error: {e}"))
+            finally:
+                GLib.idle_add(lambda: (self.reset_btn.set_label("Reset DNS"), self.reset_btn.set_sensitive(True)))
+                GLib.idle_add(lambda: (self.set_btn.set_sensitive(True), self.best_dns_btn.set_sensitive(True)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_key_released(self, controller, keyval, keycode, state):
+        if self._is_setting_dns:
+            return
+            
+        if keyval == Gdk.KEY_Return or keyval == Gdk.KEY_KP_Enter:
+            self.on_set_selected()
 
 # ----------------------------- Application -----------------------------
 class DNSJumperApp(Adw.Application):

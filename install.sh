@@ -2,7 +2,7 @@
 set -e
 
 PKG_NAME="dnsjumper"
-PKG_VERSION="1.0-1"
+PKG_VERSION="1.0-3"
 DEB_FILE="${PKG_NAME}_${PKG_VERSION}.deb"
 
 BUILD_DIR=$(mktemp -d)
